@@ -6,21 +6,38 @@ export interface VerifiedUser {
   emailVerified: boolean;
 }
 
-// Firebase publishes its signing certs here (no private credential needed).
-const CERTS_URL =
-  'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
+// Firebase publishes its signing keys as a JWK set here (no private credential
+// needed). Keys are matched to the token's `kid` header.
+const JWK_URL =
+  'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
 
-let certCache: { keys: Record<string, string>; exp: number } | null = null;
+// Minimal JWK shape used by WebCrypto importKey('jwk', ...).
+interface Jwk {
+  kid: string;
+  kty: string;
+  n: string;
+  e: string;
+  alg?: string;
+  use?: string;
+}
 
-async function getPublicKeys(env: Env): Promise<Record<string, string>> {
+let certCache: { keys: Record<string, Jwk>; exp: number } | null = null;
+
+async function getPublicKeys(env: Env): Promise<Record<string, Jwk>> {
   const now = Date.now();
   if (certCache && certCache.exp > now + 60_000) return certCache.keys;
 
-  const res = await fetch(CERTS_URL);
-  if (!res.ok) throw new Error(`Failed to fetch Firebase certs (${res.status}).`);
-  const keys = (await res.json()) as Record<string, string>;
+  const res = await fetch(JWK_URL);
+  if (!res.ok) throw new Error(`Failed to fetch Firebase public keys (${res.status}).`);
+  const data = (await res.json()) as { keys?: Jwk[] };
 
-  let ttlMs = 60 * 60 * 1000;
+  const keys: Record<string, Jwk> = {};
+  for (const k of data.keys || []) {
+    // Only RSA signing keys are valid for RS256 (the only alg we accept).
+    if (k && k.kid && k.kty === 'RSA' && k.n && k.e) keys[k.kid] = k;
+  }
+
+  let ttlMs = 5 * 60 * 1000;
   const m = /max-age=(\d+)/.exec(res.headers.get('cache-control') || '');
   if (m) ttlMs = parseInt(m[1], 10) * 1000;
   certCache = { keys, exp: now + ttlMs };
@@ -30,24 +47,6 @@ async function getPublicKeys(env: Env): Promise<Record<string, string>> {
 function b64urlDecode(s: string): string {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
   return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
-}
-
-async function importPublicKey(pem: string): Promise<CryptoKey> {
-  const der = b64urlDecode(
-    pem
-      .replace(/-----BEGIN CERTIFICATE-----/g, '')
-      .replace(/-----END CERTIFICATE-----/g, '')
-      .replace(/\s+/g, '')
-  );
-  const buf = new Uint8Array(der.length);
-  for (let i = 0; i < der.length; i++) buf[i] = der.charCodeAt(i);
-  return crypto.subtle.importKey(
-    'spki',
-    buf.buffer as ArrayBuffer,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['verify']
-  );
 }
 
 /**
@@ -83,10 +82,16 @@ export async function verifyFirebaseToken(env: Env, authHeader: string | null): 
   if (payload.iat && payload.iat > now + 300) throw new Error('INVALID_TOKEN');
 
   const keys = await getPublicKeys(env);
-  const pem = keys[header.kid];
-  if (!pem) throw new Error('INVALID_TOKEN');
+  const jwk = keys[header.kid];
+  if (!jwk) throw new Error('INVALID_TOKEN');
 
-  const publicKey = await importPublicKey(pem);
+  const publicKey = await crypto.subtle.importKey(
+    'jwk',
+    { kty: 'RSA', alg: 'RS256', use: 'sig', n: jwk.n, e: jwk.e },
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['verify']
+  );
   const sigBytes = Uint8Array.from(b64urlDecode(parts[2]), c => c.charCodeAt(0));
   const data = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
 

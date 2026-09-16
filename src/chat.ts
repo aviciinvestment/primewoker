@@ -2,7 +2,7 @@ import type { Env } from './env';
 import { verifyFirebaseToken } from './auth';
 import { embed, streamChat, chatOnce, type ChatMessage } from './nvidia';
 import { queryIndex } from './pinecone';
-import { cacheGet, cacheSet } from './cache';
+import { cacheGet, cacheSet, embedCacheGet, embedCacheSet, checkUserRateLimit } from './cache';
 import { fetchOpportunityContext, recordComplaint } from './backend';
 import {
   OFF_TOPIC_REFUSAL,
@@ -112,9 +112,35 @@ async function streamAssistantReply(env: Env, messages: ChatMessage[], cacheKey:
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
+// Bound cost + keep raw conversation text out of the KV cache: the cache key
+// is a SHA-256 hash of uid|message, and long messages are capped before use.
+const MAX_MESSAGE_LENGTH = 2000;
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+const hashCacheKey = (uid: string, message: string) => sha256Hex(`${uid}|${message}`);
+
+// Embed with a local, hash-keyed in-memory cache: repeat text never hits the
+// NVIDIA paid endpoint. The key is sha256(text) — no PII retained, and shared
+// across users (embeddings are content-derived, not user-scoped).
+async function embedCached(apiKey: string, text: string): Promise<number[]> {
+  const key = await sha256Hex(text);
+  const cached = embedCacheGet(key);
+  if (cached) return cached;
+  const vector = await embed(apiKey, text);
+  embedCacheSet(key, vector);
+  return vector;
+}
+
 // The chat pipeline. Mirrors server/src/controllers/aiController.ts chatWithAI
 // with the Mongo steps replaced by backend() calls.
-export async function handleChat(request: Request, env: Env, authHeader: string | null): Promise<Response> {
+export async function handleChat(request: Request, env: Env, authHeader: string | null, clientIp: string | null): Promise<Response> {
   let body: any;
   try {
     body = await request.json();
@@ -124,6 +150,14 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
 
   const message = String(body?.message || '').trim();
   if (!message) return json(400, { success: false, error: 'Message is required.' });
+  // Strict cap (S14): reject over-limit input outright — fail closed rather than
+  // truncating silently — to bound embed + LLM token cost per request.
+  if (message.length > MAX_MESSAGE_LENGTH) {
+    return json(400, {
+      success: false,
+      error: `Message exceeds the ${MAX_MESSAGE_LENGTH} character limit.`,
+    });
+  }
 
   const stream = body?.stream === true;
   const rawHistory = Array.isArray(body?.history) ? body.history : [];
@@ -146,7 +180,18 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
   }
   const uid = user.uid;
 
-  const cacheKey = `${uid}|${message}`;
+  // Per-user ceiling (20 req/min) enforced in KV by verified uid. Fail-open on
+  // KV errors; when exceeded, reject with 429 before any paid NVIDIA call.
+  const rl = await checkUserRateLimit(env, uid);
+  if (!rl.allowed) {
+    return json(429, {
+      success: false,
+      error: 'Rate limit exceeded. Please try again in a moment.',
+      retryAfterMs: rl.retryAfterMs,
+    });
+  }
+
+  const cacheKey = await hashCacheKey(uid, message);
   const cached = await cacheGet(env, cacheKey);
   if (cached) return stream ? doneSseResponse(cached, null) : json(200, { success: true, reply: cached });
 
@@ -160,7 +205,7 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
   // stream back the reply with the ticket number.
   if (hasMentorshipComplaint(message)) {
     try {
-      const reply = await recordComplaint(env, authHeader, message);
+      const reply = await recordComplaint(env, authHeader, message, clientIp);
       return stream ? doneSseResponse(reply, null) : json(200, { success: true, reply });
     } catch {
       const fallback = buildComplaintReply(user.email || '', makeTicket());
@@ -181,7 +226,7 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
   // RAG pipeline: embed -> Pinecone (public + user's private CV namespace) ->
   // full opportunity context from Render -> LLM.
   try {
-    const messageVector = await embed(env.NVIDIA_EMBED_API_KEY, message);
+    const messageVector = await embedCached(env.NVIDIA_EMBED_API_KEY, message);
 
     const matches = await queryIndex(env, messageVector, 5);
     const matchIds = matches.map(m => m.id);
@@ -189,7 +234,7 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
     let retrievedContext =
       'No specific opportunities were retrieved for this question. Answer generally using your knowledge.';
     if (matchIds.length > 0) {
-      const ctx = await fetchOpportunityContext(env, authHeader, matchIds);
+      const ctx = await fetchOpportunityContext(env, authHeader, matchIds, clientIp);
       if (ctx) retrievedContext = ctx;
     }
 

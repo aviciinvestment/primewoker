@@ -7,8 +7,24 @@ const json = (status: number, data: unknown, extraHeaders: Record<string, string
     headers: { 'Content-Type': 'application/json', ...extraHeaders },
   });
 
-function corsHeaders(env: Env): Record<string, string> {
-  const allowed = env.ALLOWED_ORIGINS || '*';
+function corsHeaders(env: Env, request: Request): Record<string, string> {
+  const origin = request.headers.get('Origin');
+  let allowed = '';
+
+  // Split comma-separated allowlist, strip whitespace, reject any origin not
+  // explicitly listed. Fail closed — a missing/empty env denies all cross-origin
+  // traffic (no wildcard); same-origin requests are unaffected because browsers
+  // only enforce CORS when an Origin header is actually sent.
+  const allowlist = (env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean);
+
+  // Echo back the exact matching origin (no wildcards, no comma-joined list).
+  if (origin && allowlist.includes(origin)) {
+    allowed = origin;
+  }
+
   return {
     'Access-Control-Allow-Origin': allowed,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -20,7 +36,7 @@ function corsHeaders(env: Env): Record<string, string> {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const cors = corsHeaders(env);
+    const cors = corsHeaders(env, request);
 
     // Preflight for the browser client.
     if (request.method === 'OPTIONS') {
@@ -31,10 +47,20 @@ export default {
       return json(404, { success: false, error: 'Not found.' }, cors);
     }
 
-    const res = await handleChat(request, env, request.headers.get('Authorization'));
+    // Standard Cloudflare header carrying the client's true IP (set on ingress,
+    // cannot be spoofed by the caller). Forwarded to the backend per request.
+    const res = await handleChat(
+      request,
+      env,
+      request.headers.get('Authorization'),
+      request.headers.get('CF-Connecting-IP') || null
+    );
 
+    // Always re-derive headers with the matched origin so the browser sees
+    // the correct single-origin header on every response path.
+    const resCors = corsHeaders(env, request);
     const headers = new Headers(res.headers);
-    for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+    for (const [k, v] of Object.entries(resCors)) headers.set(k, v);
     return new Response(res.body, { status: res.status, headers });
   },
 };
