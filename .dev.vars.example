@@ -1,0 +1,7 @@
+# Copy to .dev.vars (git-ignored) for `wrangler dev` local testing.
+# These are SECRETS — never commit the real values.
+NVIDIA_API_KEY=your-nvidia-chat-api-key
+NVIDIA_EMBED_API_KEY=your-nvidia-embed-api-key
+PINECONE_API_KEY=your-pinecone-api-key
+PINECONE_HOST=your-index-host.svc.region.pinecone.io
+BACKEND_ORIGIN=https://your-backend.onrender.com

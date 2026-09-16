@@ -1,0 +1,30 @@
+name = "primeopportunity-assistant"
+main = "src/index.ts"
+compatibility_date = "2025-01-27"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Non-secret configuration (secrets go via `wrangler secret put`).
+# Production values are NOT committed to this file — set them with
+#   wrangler secret put NVIDIA_API_KEY
+#   wrangler secret put NVIDIA_EMBED_API_KEY
+#   wrangler secret put PINECONE_API_KEY
+# and the following in [vars] / real deployment: PINECONE_HOST, BACKEND_ORIGIN.
+[vars]
+FIREBASE_PROJECT_ID = "primeopportunity-18381"
+PINECONE_INDEX = "prime-opportunity-index"
+# Data-plane host of your Pinecone index (from Pinecone console -> your index ->
+# "Environment"/"Host"). Example: prime-opportunity-index-abc123.svc.us-east1-gcp.pinecone.io
+PINECONE_HOST = "prime-opportunity-index-x3bxlpw.svc.aped-4627-b74a.pinecone.io"
+# Render origin WITHOUT any path, e.g. https://primeopportunity-backend.onrender.com
+BACKEND_ORIGIN = "https://primebackend-ixhd.onrender.com"
+MENTORSHIP_FEE = "20000"
+MENTORSHIP_CURRENCY = "NGN"
+# Browser origin(s) allowed to call this Worker. Comma-separated for multiple.
+ALLOWED_ORIGINS = "https://prime-ed.vercel.app"
+
+# Assistant reply dedupe cache. Create the namespace once, then paste the real id:
+#   wrangler kv namespace create AI_CACHE
+[[kv_namespaces]]
+binding = "AI_CACHE"
+id = "8909b255501f42a089209a2da49677e3"
