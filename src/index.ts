@@ -21,16 +21,16 @@ function corsHeaders(env: Env, request: Request): Record<string, string> {
     .filter(Boolean);
 
   // Echo back the exact matching origin (no wildcards, no comma-joined list).
-  if (origin && allowlist.includes(origin)) {
-    allowed = origin;
-  }
-
-  return {
-    'Access-Control-Allow-Origin': allowed,
+  // If no origin matched, OMIT the header entirely instead of sending an empty
+  // "Access-Control-Allow-Origin: " — an empty value is still seen by some
+  // browsers as a CORS grant for the request origin and is sloppy/failure-prone.
+  const headers: Record<string, string> = {
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
   };
+  if (allowed) headers['Access-Control-Allow-Origin'] = allowed;
+  return headers;
 }
 
 export default {
