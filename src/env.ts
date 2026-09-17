@@ -10,6 +10,9 @@ export interface Env {
   PINECONE_INDEX?: string;
   PINECONE_HOST?: string;
   BACKEND_ORIGIN?: string;
+  // Comma-separated NVIDIA chat model battery (optional; overrides the default
+  // list in nvidia.ts). Useful because NVIDIA gates models per request-source.
+  NVIDIA_CHAT_MODELS?: string;
   MENTORSHIP_FEE?: string;
   MENTORSHIP_CURRENCY?: string;
   ALLOWED_ORIGINS?: string;

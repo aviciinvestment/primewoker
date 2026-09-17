@@ -20,8 +20,14 @@ PINECONE_HOST = "prime-opportunity-index-x3bxlpw.svc.aped-4627-b74a.pinecone.io"
 BACKEND_ORIGIN = "https://primebackend-ixhd.onrender.com"
 MENTORSHIP_FEE = "20000"
 MENTORSHIP_CURRENCY = "NGN"
-# Browser origin(s) allowed to call this Worker. Comma-separated for multiple.
-ALLOWED_ORIGINS = "https://prime-ed.vercel.app"
+# CORS is now handled in code by echoing the request origin (no allowlist), so
+# ALLOWED_ORIGINS is no longer needed. Chat stays protected by Firebase auth +
+# per-user rate limits.
+
+# Keep the free-tier Render backend warm (free plans sleep after ~15 min idle).
+# Free Workers plan allows ~50 cron invocations/day, so every 30 min is safe.
+[triggers]
+crons = ["*/30 * * * *"]
 
 # Assistant reply dedupe cache. Create the namespace once, then paste the real id:
 #   wrangler kv namespace create AI_CACHE
