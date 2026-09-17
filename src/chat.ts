@@ -228,6 +228,7 @@ async function emitAssistantReply(
       const budget = Math.min(CHAT_ATTEMPT_TIMEOUT_MS, remainingMs());
       if (budget < 3000) break;
 
+      let timedOut = false;
       try {
         const upstream = await streamChat(env.NVIDIA_API_KEY, model, messages, signal, budget);
         if (!upstream.ok || !upstream.body) {
@@ -271,7 +272,13 @@ async function emitAssistantReply(
           }
         }
       } catch (err) {
-        lastError = `${model}: ${(err as Error)?.message || String(err)}`;
+        const detail = `${(err as Error)?.name || 'Error'}: ${(err as Error)?.message || String(err)}`;
+        // A timeout/abort means this model accepted the connection but never
+        // streamed (the gpt-oss/glm failure mode). Retrying the SAME model just
+        // burns another full timeout and can eat the whole deadline before a
+        // healthy model is ever tried, so skip straight to the next model.
+        timedOut = /abort|timeout/i.test(detail);
+        lastError = `${model}: ${detail}`;
       }
 
       if (signal.aborted) return;
@@ -281,6 +288,7 @@ async function emitAssistantReply(
         emit({ type: 'done', reply, action: null });
         return;
       }
+      if (timedOut) break;
     }
 
     if (remainingMs() < 3000) break;

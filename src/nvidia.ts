@@ -11,16 +11,19 @@ const NVIDIA_BASE = 'https://integrate.api.nvidia.com/v1';
 const EMBED_MODEL = 'nvidia/nemotron-3-embed-1b';
 
 // NVIDIA gates models PER REQUEST-SOURCE: a model that answers from one egress
-// (e.g. a home/US IP) can return 400/404 from Cloudflare's. The worker used to
-// pin one model, so when that model was unavailable the chat had nothing to fall
-// back to. This battery is tried in order; the fast 20B model stays primary and
-// the rest mirror the Express server's verified-good set. Override at deploy
-// time with the NVIDIA_CHAT_MODELS var (comma-separated) without a code change.
+// (e.g. a home/US IP) can return 400/404 from Cloudflare's, and some catalog
+// models (gpt-oss-20b, glm-5.3[-flash], nemotron-3.5-lightning) accept the
+// connection then NEVER stream — the exact cause of the old infinite
+// "AI is thinking...". So the healthy, verified-answering models go FIRST, and
+// the previously-dead ones stay as last-resort fallbacks in case the gateway
+// recovers. Probed against this account: nemotron-3-nano answered in ~3s and
+// muse-glimmer in ~4.5s. Override at deploy time with NVIDIA_CHAT_MODELS
+// (comma-separated) without a code change.
 const DEFAULT_CHAT_MODELS = [
-  'openai/gpt-oss-20b',
-  'meta/muse-glimmer-30b',
-  'z-ai/glm-5.3-flash',
   'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
+  'meta/muse-glimmer-30b',
+  'openai/gpt-oss-20b',
+  'z-ai/glm-5.3-flash',
 ];
 
 export function chatModels(env: Env): string[] {
@@ -35,11 +38,13 @@ export function chatModels(env: Env): string[] {
 
 // Hard per-request ceilings. Without these a provider that accepts the
 // connection but never streams leaves the chat stuck on "AI is thinking..."
-// forever (the UI has no client-side timeout either). The embedding is fast, so
-// it gets a short leash; chat attempts are longer but still bounded, and the
-// caller additionally enforces an overall wall-clock deadline.
+// forever (the UI has no client-side timeout either). The timeout bounds the
+// WHOLE stream, not just the first byte, so it must be long enough for a full
+// answer (healthy models here first-token in ~1-3s and finish well inside it).
+// The embedding is fast, so it gets a shorter leash; the caller additionally
+// enforces an overall wall-clock deadline across the whole battery.
 const EMBED_TIMEOUT_MS = 20_000;
-export const CHAT_ATTEMPT_TIMEOUT_MS = 45_000;
+export const CHAT_ATTEMPT_TIMEOUT_MS = 30_000;
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -79,7 +84,7 @@ const chatPayload = (model: string, messages: ChatMessage[], stream: boolean) =>
   messages,
   temperature: 0.6,
   top_p: 0.95,
-  max_tokens: 500,
+  max_tokens: 700,
   stream,
 });
 
