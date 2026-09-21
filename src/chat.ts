@@ -3,7 +3,7 @@ import { verifyFirebaseToken } from './auth';
 import { embed, streamChat, chatOnce, chatModels, CHAT_ATTEMPT_TIMEOUT_MS, type ChatMessage } from './nvidia';
 import { queryIndex, type PineconeMatch } from './pinecone';
 import { cacheGet, cacheSet, embedCacheGet, embedCacheSet, checkUserRateLimit } from './cache';
-import { recordComplaint } from './backend';
+import { recordComplaint, logChat } from './backend';
 import {
   OFF_TOPIC_REFUSAL,
   isOffTopic,
@@ -165,14 +165,24 @@ function ragStreamResponse(
   uid: string,
   message: string,
   history: ChatMessage[],
-  preEmbed: Promise<number[]> | null
+  preEmbed: Promise<number[]> | null,
+  authHeader: string | null,
+  userName: string,
+  clientIp: string | null
 ): Response {
   const encoder = new TextEncoder();
   const abort = new AbortController();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const emit = (obj: unknown) => controller.enqueue(encoder.encode(frame(obj)));
+      // Capture the final reply so the finished exchange can be logged for the
+      // admin Chat Activity feed (fire-and-forget, never blocks the stream).
+      let finalReply = '';
+      const emit = (obj: unknown) => {
+        const typed = obj as { type?: string; reply?: string };
+        if (typed?.type === 'done' && typeof typed.reply === 'string') finalReply = typed.reply;
+        controller.enqueue(encoder.encode(frame(obj)));
+      };
       try {
         const messages = await buildRagMessages(env, uid, message, history, preEmbed, emit);
         emit({ type: 'status', step: STATUS_THINKING });
@@ -183,6 +193,9 @@ function ragStreamResponse(
           emit({ type: 'error', message: 'Failed to process chat message.' });
         }
       } finally {
+        if (finalReply) {
+          void logChat(env, authHeader, { message, reply: finalReply, userName }, clientIp);
+        }
         controller.close();
       }
     },
@@ -373,6 +386,9 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
   }
 
   const stream = body?.stream === true;
+  // Display name for the admin Chat Activity feed. Server-side the verified uid
+  // always wins for identity; this is read-only readability metadata only.
+  const userName = String(body?.userName || '').trim();
   const rawHistory = Array.isArray(body?.history) ? body.history : [];
   // Keep the prompt lean: last few messages only, each capped, so the LLM's
   // first token isn't delayed by a huge prefill.
@@ -419,6 +435,11 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
     cacheGet(env, cacheKey),
   ]);
 
+  // Best-effort audit trail: log every completed exchange (fire-and-forget).
+  const tryLogChat = (reply: string) => {
+    void logChat(env, authHeader, { message, reply, userName }, clientIp);
+  };
+
   // Per-user ceiling (20 req/min) enforced in KV by verified uid. Fail-open on
   // KV errors; when exceeded, reject with 429 before any paid NVIDIA call.
   if (!rl.allowed) {
@@ -428,11 +449,15 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
       retryAfterMs: rl.retryAfterMs,
     });
   }
-  if (cached) return stream ? doneSseResponse(cached, null) : json(200, { success: true, reply: cached });
+  if (cached) {
+    tryLogChat(cached);
+    return stream ? doneSseResponse(cached, null) : json(200, { success: true, reply: cached });
+  }
 
   // Hard guardrail: refuse clearly out-of-scope questions without an LLM call.
   if (offTopic) {
     const reply = OFF_TOPIC_REFUSAL;
+    tryLogChat(reply);
     return stream ? doneSseResponse(reply, null) : json(200, { success: true, reply });
   }
 
@@ -441,9 +466,11 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
   if (complaint) {
     try {
       const reply = await recordComplaint(env, authHeader, message, clientIp);
+      tryLogChat(reply);
       return stream ? doneSseResponse(reply, null) : json(200, { success: true, reply });
     } catch {
       const fallback = buildComplaintReply(user.email || '', makeTicket());
+      tryLogChat(fallback);
       return stream ? doneSseResponse(fallback, null) : json(200, { success: true, reply: fallback });
     }
   }
@@ -454,6 +481,7 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
     const fee = env.MENTORSHIP_FEE || '20000';
     const currency = env.MENTORSHIP_CURRENCY || 'NGN';
     const reply = buildMentorshipReply(fee, currency);
+    tryLogChat(reply);
     if (stream) return doneSseResponse(reply, { type: 'mentorship' });
     return json(200, { success: true, reply, action: { type: 'mentorship' } });
   }
@@ -464,7 +492,7 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
   // fired above is already in flight, so its RTT is spent by the time the stream
   // starts consuming it.
   if (stream) {
-    return ragStreamResponse(env, uid, message, history, embedPromise);
+    return ragStreamResponse(env, uid, message, history, embedPromise, authHeader, userName, clientIp);
   }
 
   // Non-stream (JSON) path: run eagerly and return the full reply at once.
@@ -482,6 +510,7 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
     }
     if (!reply.trim()) throw new Error(lastError || 'No AI model returned a reply.');
     await cacheSet(env, cacheKey, reply);
+    tryLogChat(reply);
     return json(200, { success: true, reply });
   } catch (err) {
     console.error('AI chat error:', err);

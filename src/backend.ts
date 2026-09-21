@@ -66,3 +66,20 @@ export async function recordComplaint(
   }
   return data.reply;
 }
+
+// Persist a finished WORKER-produced exchange for the admin Chat Activity feed.
+// The reply was already streamed to the user when this runs, so it is pure
+// fire-and-forget: the backend identity is re-verified via the forwarded auth
+// header, and any failure is logged (never thrown) so chat is never slowed.
+export async function logChat(
+  env: Env,
+  auth: string | null,
+  payload: { message: string; reply: string; userName?: string },
+  clientIp: string | null = null
+): Promise<void> {
+  try {
+    await backendFetch(env, '/api/ai/chat-log', auth, payload, clientIp);
+  } catch (err) {
+    console.error('Failed to log chat:', (err as Error)?.message || err);
+  }
+}
