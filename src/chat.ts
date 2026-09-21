@@ -193,8 +193,12 @@ function ragStreamResponse(
           emit({ type: 'error', message: 'Failed to process chat message.' });
         }
       } finally {
+        // Await the log BEFORE closing the stream: after this stream finishes,
+        // the worker event completes and Cloudflare may tear the isolate down,
+        // cancelling any still-pending fetch. logChat swallows errors, so this
+        // can never fail the response.
         if (finalReply) {
-          void logChat(env, authHeader, { message, reply: finalReply, userName }, clientIp);
+          await logChat(env, authHeader, { message, reply: finalReply, userName }, clientIp);
         }
         controller.close();
       }
@@ -435,9 +439,11 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
     cacheGet(env, cacheKey),
   ]);
 
-  // Best-effort audit trail: log every completed exchange (fire-and-forget).
-  const tryLogChat = (reply: string) => {
-    void logChat(env, authHeader, { message, reply, userName }, clientIp);
+  // Audit trail: await (not fire-and-forget) so the Worker runtime can't cancel
+  // the fetch when the response event ends. logChat swallows errors, so this
+  // never fails the reply. Only the snapshot replies that need the LLM skip it.
+  const tryLogChat = async (reply: string) => {
+    await logChat(env, authHeader, { message, reply, userName }, clientIp);
   };
 
   // Per-user ceiling (20 req/min) enforced in KV by verified uid. Fail-open on
@@ -450,14 +456,14 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
     });
   }
   if (cached) {
-    tryLogChat(cached);
+    await tryLogChat(cached);
     return stream ? doneSseResponse(cached, null) : json(200, { success: true, reply: cached });
   }
 
   // Hard guardrail: refuse clearly out-of-scope questions without an LLM call.
   if (offTopic) {
     const reply = OFF_TOPIC_REFUSAL;
-    tryLogChat(reply);
+    await tryLogChat(reply);
     return stream ? doneSseResponse(reply, null) : json(200, { success: true, reply });
   }
 
@@ -466,11 +472,11 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
   if (complaint) {
     try {
       const reply = await recordComplaint(env, authHeader, message, clientIp);
-      tryLogChat(reply);
+      await tryLogChat(reply);
       return stream ? doneSseResponse(reply, null) : json(200, { success: true, reply });
     } catch {
       const fallback = buildComplaintReply(user.email || '', makeTicket());
-      tryLogChat(fallback);
+      await tryLogChat(fallback);
       return stream ? doneSseResponse(fallback, null) : json(200, { success: true, reply: fallback });
     }
   }
@@ -481,7 +487,7 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
     const fee = env.MENTORSHIP_FEE || '20000';
     const currency = env.MENTORSHIP_CURRENCY || 'NGN';
     const reply = buildMentorshipReply(fee, currency);
-    tryLogChat(reply);
+    await tryLogChat(reply);
     if (stream) return doneSseResponse(reply, { type: 'mentorship' });
     return json(200, { success: true, reply, action: { type: 'mentorship' } });
   }
@@ -510,7 +516,7 @@ export async function handleChat(request: Request, env: Env, authHeader: string 
     }
     if (!reply.trim()) throw new Error(lastError || 'No AI model returned a reply.');
     await cacheSet(env, cacheKey, reply);
-    tryLogChat(reply);
+    await tryLogChat(reply);
     return json(200, { success: true, reply });
   } catch (err) {
     console.error('AI chat error:', err);

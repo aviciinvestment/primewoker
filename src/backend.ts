@@ -71,6 +71,12 @@ export async function recordComplaint(
 // The reply was already streamed to the user when this runs, so it is pure
 // fire-and-forget: the backend identity is re-verified via the forwarded auth
 // header, and any failure is logged (never thrown) so chat is never slowed.
+//
+// Uses a LONGER timeout than the hot-path calls: Render's free tier cold-starts
+// in 20-90s, and a cold instance would fail the old 7s budget, silently
+// dropping logs. Callers await this so the Worker runtime can't tear down the
+// isolate mid-fetch (a fire-and-forget fetch after the response is returned is
+// not guaranteed to complete in Workers).
 export async function logChat(
   env: Env,
   auth: string | null,
@@ -78,7 +84,7 @@ export async function logChat(
   clientIp: string | null = null
 ): Promise<void> {
   try {
-    await backendFetch(env, '/api/ai/chat-log', auth, payload, clientIp);
+    await backendFetch(env, '/api/ai/chat-log', auth, payload, clientIp, 30_000);
   } catch (err) {
     console.error('Failed to log chat:', (err as Error)?.message || err);
   }
